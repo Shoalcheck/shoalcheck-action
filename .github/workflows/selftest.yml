@@ -1,0 +1,28 @@
+name: selftest
+# Runs this action from the repository itself on every runner image it supports: download, signature and
+# checksum verification, PATH, and the exit code passed through. No cluster is needed for `version`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - id: sc
+        uses: ./
+        with:
+          args: version
+      - shell: bash
+        run: |
+          echo "exit-code=${{ steps.sc.outputs.exit-code }} version=${{ steps.sc.outputs.version }}"
+          test "${{ steps.sc.outputs.exit-code }}" = 0
+          shoalcheck version | head -1 | grep -q "shoalcheck ${{ steps.sc.outputs.version }}"
