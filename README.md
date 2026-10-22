@@ -14,6 +14,7 @@ The signing key is pinned in this repository (`cosign.pub`) and compared with `c
 | `kubeconfig` | | kubeconfig content (secret), read-only identity |
 | `capture-key` | | public key a capture must be signed by |
 | `licence` | | Team licence key (secret) |
+| `summary` | `false` | copy the output into the job summary; public on a public repository, so off by default |
 
 Outputs: `exit-code`, `version`. Shoalcheck is read-only (`get`/`list` only); nothing is applied to a cluster.
 

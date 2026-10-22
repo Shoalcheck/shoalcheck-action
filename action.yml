@@ -35,6 +35,12 @@ inputs:
     required: false
     default: ''
 
+  summary:
+    description: >-
+      Copy the command's output into the job summary. Off by default: on a public repository the summary is
+      public, and a reading names namespaces, workloads and nodes. Prefer `-o markdown` for a pull-request comment.
+    required: false
+    default: 'false'
 outputs:
   exit-code:
     description: "The exit code of shoalcheck: 0 policy satisfied, 2 policy fired, 1 the run could not be made, 4 licence does not cover the command. The step also fails with this code."
@@ -71,6 +77,7 @@ runs:
         SHOALCHECK_CAPTURE_KEY: ${{ inputs.capture-key }}
         SHOALCHECK_LICENCE: ${{ inputs.licence }}
         SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck-home
+        SUMMARY: ${{ inputs.summary }}
       run: |
         if [ -n "$KUBECONFIG_CONTENT" ]; then
           umask 077
@@ -84,7 +91,10 @@ runs:
         shoalcheck "${argv[@]}" 2>&1 | tee "$RUNNER_TEMP/shoalcheck-output.txt"
         code=${PIPESTATUS[0]}
         set -e
-        { echo '### shoalcheck'; echo '```'; cat "$RUNNER_TEMP/shoalcheck-output.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$SUMMARY" = true ]; then
+          { echo '### shoalcheck'; echo '~~~~text'; cat "$RUNNER_TEMP/shoalcheck-output.txt"; echo '~~~~'; } >> "$GITHUB_STEP_SUMMARY"
+        fi
+        rm -f "$RUNNER_TEMP/shoalcheck-output.txt"
         rm -f "$RUNNER_TEMP/shoalcheck-kubeconfig"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         exit "$code"
