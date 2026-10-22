@@ -1,5 +1,5 @@
 name: Shoalcheck gate
-description: Read-only Kubernetes preflight gate. Installs a signature-verified Shoalcheck release and fails the job on what a pull request or the cluster changed.
+description: Read-only Kubernetes preflight for pull requests: installs a signature-verified Shoalcheck and gates the change.
 author: Shoalcheck
 branding:
   icon: shield
