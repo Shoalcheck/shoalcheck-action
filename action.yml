@@ -1,0 +1,90 @@
+name: Shoalcheck gate
+description: Read-only Kubernetes preflight gate. Installs a signature-verified Shoalcheck release and fails the job on what a pull request or the cluster changed.
+author: Shoalcheck
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  version:
+    description: >-
+      Shoalcheck release to install, with or without the leading v. Pin it: a pipeline should not change under you.
+    required: false
+    default: '0.1.0-rc.12'
+  args:
+    description: >-
+      Arguments passed to `shoalcheck`, split on whitespace (no shell quoting). Example: `gate --with rendered/ --fail-on new:high`.
+    required: false
+    default: gate
+  working-directory:
+    description: Directory to run in.
+    required: false
+    default: '.'
+  kubeconfig:
+    description: >-
+      Kubeconfig CONTENT (a secret) for a read-only identity (`shoalcheck audit --show-permissions` prints what it needs).
+      Written to a file under the runner temp dir and exported as KUBECONFIG. Leave empty for capture or manifests-only runs.
+    required: false
+    default: ''
+  capture-key:
+    description: Public key a capture must be signed by (exported as SHOALCHECK_CAPTURE_KEY). Use with `--capture <file>` in args.
+    required: false
+    default: ''
+  licence:
+    description: Team licence key (exported as SHOALCHECK_LICENCE). Pass it from a secret; the gate is a Team command except --manifests-only.
+    required: false
+    default: ''
+
+outputs:
+  exit-code:
+    description: "The exit code of shoalcheck: 0 policy satisfied, 2 policy fired, 1 the run could not be made, 4 licence does not cover the command. The step also fails with this code."
+    value: ${{ steps.run.outputs.exit-code }}
+  version:
+    description: The version that was installed.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      with:
+        cosign-release: v2.5.2
+
+    - name: Install shoalcheck (cosign + sha256 verified)
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        DEST: ${{ runner.temp }}/shoalcheck-bin
+      run: |
+        "$GITHUB_ACTION_PATH/scripts/install.sh"
+        echo "$DEST" >> "$GITHUB_PATH"
+        echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+    - name: Run shoalcheck
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ARGS: ${{ inputs.args }}
+        KUBECONFIG_CONTENT: ${{ inputs.kubeconfig }}
+        SHOALCHECK_CAPTURE_KEY: ${{ inputs.capture-key }}
+        SHOALCHECK_LICENCE: ${{ inputs.licence }}
+        SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck-home
+      run: |
+        if [ -n "$KUBECONFIG_CONTENT" ]; then
+          umask 077
+          printf '%s\n' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/shoalcheck-kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/shoalcheck-kubeconfig"
+        fi
+        [ -n "$SHOALCHECK_CAPTURE_KEY" ] || unset SHOALCHECK_CAPTURE_KEY
+        [ -n "$SHOALCHECK_LICENCE" ] || unset SHOALCHECK_LICENCE
+        set -f; read -r -a argv <<< "$ARGS"; set +f
+        set +e
+        shoalcheck "${argv[@]}" 2>&1 | tee "$RUNNER_TEMP/shoalcheck-output.txt"
+        code=${PIPESTATUS[0]}
+        set -e
+        { echo '### shoalcheck'; echo '```'; cat "$RUNNER_TEMP/shoalcheck-output.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        rm -f "$RUNNER_TEMP/shoalcheck-kubeconfig"
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit "$code"
