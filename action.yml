@@ -210,7 +210,8 @@ runs:
       run: |
         out="$RUNNER_TEMP/shoalcheck-base"
         export KUBECONFIG="$RUNNER_TEMP/shoalcheck-kubeconfig"
-        printf '%s\n' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"; chmod 600 "$KUBECONFIG"
+        trap 'rm -f "$KUBECONFIG"' EXIT
+        ( umask 077; printf '%s\n' "$KUBECONFIG_CONTENT" > "$KUBECONFIG" )
         args=(gate --fail-on "$FAIL_ON" --md "$RUNNER_TEMP/shoalcheck-comment.md" --json "$RUNNER_TEMP/shoalcheck-reading.json")
         [ -n "$CONTEXT" ] && args+=(--context "$CONTEXT")
         [ -f "$out/baseline.json" ] && args+=(--baseline "$out/baseline.json")
@@ -245,7 +246,6 @@ runs:
           echo "$line" >> "$GITHUB_STEP_SUMMARY"
           rm -f "$held" "$RUNNER_TEMP/shoalcheck-comment.md"
         fi
-        rm -f "$KUBECONFIG"
 
     # ONE COMMENT PER PULL REQUEST, found by the marker on its first line and updated in place, so twenty pushes leave
     # one comment saying what the latest one decided rather than twenty.
