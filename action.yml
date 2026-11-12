@@ -1,5 +1,24 @@
+# shoalcheck gate, as one step: `uses: Shoalcheck/shoalcheck-action@v2` (this file is that repository's action.yml from
+# v2 on). v1 is another interface, a passthrough of shoalcheck's arguments, and stays at its own tags.
+#
+# WHAT IT DOES, IN ORDER. Installs the release you pin, checked the way it is signed (cosign over checksums.txt with the
+# release key written here, then the archive against its checksum). Takes the baseline and the acceptance file from the
+# BRANCH BEING MERGED INTO, never from the pull request: a request that edits either could record or accept its own
+# finding and pass its own gate. Runs the gate once, and from that one run writes the verdict to the job log, the run's
+# summary, the lines of the pull request's diff (annotations, on any repository) and one pull-request comment it
+# updates on every push. Ends on the gate's own exit code: 0 satisfied, 2 fired, 1 could not be judged, 4 no licence.
+#
+# A PULL REQUEST FROM A FORK is given no secrets, so it is given no licence and no cluster. Nothing is judged, and the
+# step FAILS: a required check that went green over nothing would merge what nobody looked at. A repository that
+# accepts that for forks says so with allow-ungated: 'true', and the run then ends on 0 with a warning saying it was
+# not gated.
+#
+# A PUBLIC REPOSITORY PUBLISHES NOTHING OF THE READING unless it says so. Its job log, run summary, annotations and
+# comments are readable by anyone, and a reading names namespaces, workloads and nodes. There the step prints only the
+# gate's exit code and what it means; public-details: 'true' publishes the rest as on a private repository. A
+# repository whose visibility the step cannot read is treated as public.
 name: Shoalcheck gate
-description: 'Read-only Kubernetes preflight for pull requests. Installs a signature-verified Shoalcheck and gates the change.'
+description: Read a Kubernetes cluster read-only and fail the job on what a pull request or the cluster changed.
 author: Shoalcheck
 branding:
   icon: shield
@@ -7,94 +26,250 @@ branding:
 
 inputs:
   version:
-    description: >-
-      Shoalcheck release to install, with or without the leading v. Pin it: a pipeline should not change under you.
-    required: false
-    default: '0.1.0-rc.12'
-  args:
-    description: >-
-      Arguments passed to `shoalcheck`, split on whitespace (no shell quoting). Example: `gate --with rendered/ --fail-on new:high`.
-    required: false
-    default: gate
-  working-directory:
-    description: Directory to run in.
-    required: false
-    default: '.'
-  kubeconfig:
-    description: >-
-      Kubeconfig CONTENT (a secret) for a read-only identity (`shoalcheck audit --show-permissions` prints what it needs).
-      Written to a file under the runner temp dir and exported as KUBECONFIG. Leave empty for capture or manifests-only runs.
-    required: false
-    default: ''
-  capture-key:
-    description: Public key a capture must be signed by (exported as SHOALCHECK_CAPTURE_KEY). Use with `--capture <file>` in args.
-    required: false
-    default: ''
+    description: The release to install, without the leading v (0.2.0). Pinned, never "latest".
+    required: true
   licence:
-    description: Team licence key (exported as SHOALCHECK_LICENCE). Pass it from a secret; the gate is a Team command except --manifests-only.
-    required: false
+    description: A Team licence key (secrets.SHOALCHECK_LICENCE).
+    required: true
+  kubeconfig:
+    description: A kubeconfig with the read-only access `shoalcheck audit --show-permissions` prints (secrets.KUBECONFIG).
+    required: true
+  context:
+    description: The kube context to read. Empty is the kubeconfig's current one.
     default: ''
-
-  summary:
-    description: >-
-      Copy the command's output into the job summary. Off by default: on a public repository the summary is
-      public, and a reading names namespaces, workloads and nodes. Prefer `-o markdown` for a pull-request comment.
-    required: false
+  baseline:
+    description: The baseline's path in the repository, read from the branch being merged into. Empty judges the change alone.
+    default: .shoalcheck/baseline.json
+  with:
+    description: The pull request's rendered manifests (a file or a directory). Empty judges the cluster against its baseline alone.
+    default: ''
+  namespace:
+    description: With `with`, the namespace a manifest that names none lands in.
+    default: ''
+  fail-on:
+    description: The policy (new, regressed, present, unreadable, not-evaluated, cost:+N, none), comma-separated.
+    default: new:high,regressed,unreadable
+  accept:
+    description: The acceptance file's path in the repository, read from the branch being merged into. Used when it exists there.
+    default: .shoalcheck/accept.yaml
+  comment:
+    description: Post the verdict as one pull-request comment, updated on every push (needs pull-requests write). On a public repository only with public-details.
+    default: 'true'
+  annotations:
+    description: Put each finding on the line of the diff that carried it. On a public repository only with public-details.
+    default: 'true'
+  public-details:
+    description: "'true' publishes the verdict's details on a public repository too: the job log, the run summary, the annotations and the comment, all readable by anyone. Default: there the step prints only the exit code."
     default: 'false'
+  github-token:
+    description: The token the comment is posted with.
+    default: ${{ github.token }}
+  allow-ungated:
+    description: "'true' lets a run with no licence or no cluster credentials (a fork's pull request) end on 0, with a warning. Default: it fails."
+    default: 'false'
+
 outputs:
   exit-code:
-    description: "The exit code of shoalcheck: 0 policy satisfied, 2 policy fired, 1 the run could not be made, 4 licence does not cover the command. The step also fails with this code."
-    value: ${{ steps.run.outputs.exit-code }}
-  version:
-    description: The version that was installed.
-    value: ${{ steps.install.outputs.version }}
+    description: The gate's exit code (0 satisfied, 2 fired, 1 could not be judged, 4 no licence); empty when the run was not gated.
+    value: ${{ steps.gate.outputs.exit-code }}
+  gated:
+    description: '"true" when the gate ran; "false" when the run had no licence or no cluster credentials.'
+    value: ${{ steps.secrets.outputs.present }}
+  published:
+    description: '"true" when the details went to the log, the summary, the annotations and the comment; "false" when a public repository withheld them.'
+    value: ${{ steps.visibility.outputs.publish }}
 
 runs:
   using: composite
   steps:
-    - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+    - name: Secrets present
+      id: secrets
+      shell: bash
+      env:
+        LICENCE: ${{ inputs.licence }}
+        KUBECONFIG_CONTENT: ${{ inputs.kubeconfig }}
+        ALLOW_UNGATED: ${{ inputs.allow-ungated }}
+      run: |
+        if [ -n "$LICENCE" ] && [ -n "$KUBECONFIG_CONTENT" ]; then
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "present=false" >> "$GITHUB_OUTPUT"
+        msg="shoalcheck did not gate this run: it has no licence or no cluster credentials (a pull request from a fork is given neither). Nothing was read and nothing was compared, so this is not a pass."
+        echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+        if [ "$ALLOW_UNGATED" = "true" ]; then
+          echo "::warning title=shoalcheck did not gate this run::$msg (allow-ungated is set, so the job is not failed)"
+          exit 0
+        fi
+        echo "::error title=shoalcheck did not gate this run::$msg Set allow-ungated: 'true' to let such a run pass."
+        exit 1
+
+    # The event says whether the repository is private; a schedule's does not, so the API is asked, and a visibility
+    # neither one gives is public.
+    - name: Repository visibility
+      id: visibility
+      shell: bash
+      env:
+        PRIVATE: ${{ github.event.repository.private }}
+        PUBLIC_DETAILS: ${{ inputs.public-details }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+      run: |
+        case "$PRIVATE" in
+          true|false) ;;
+          *) PRIVATE=$(gh api "repos/$REPO" --jq .private 2>/dev/null || true) ;;
+        esac
+        if [ "$PRIVATE" = "true" ] || [ "$PUBLIC_DETAILS" = "true" ]; then
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "publish=false" >> "$GITHUB_OUTPUT"
+          echo "This repository is public, or its visibility could not be read: the reading's details stay out of the log, the summary, the annotations and the comment. public-details: 'true' publishes them."
+        fi
+
+    - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      if: steps.secrets.outputs.present == 'true'
       with:
         cosign-release: v2.5.2
 
-    - name: Install shoalcheck (cosign + sha256 verified)
-      id: install
+    - name: Install shoalcheck
+      if: steps.secrets.outputs.present == 'true'
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
-        DEST: ${{ runner.temp }}/shoalcheck-bin
       run: |
-        "$GITHUB_ACTION_PATH/scripts/install.sh"
-        echo "$DEST" >> "$GITHUB_PATH"
-        echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+        case "$VERSION" in ''|latest|v*) echo "::error::version is a release without the leading v (0.2.0), pinned"; exit 1;; esac
+        dir="$RUNNER_TEMP/shoalcheck-install"; mkdir -p "$dir"; cd "$dir"
+        base="https://github.com/Shoalcheck/shoalcheck/releases/download/v${VERSION}"
+        archive="shoalcheck_${VERSION}_linux_amd64.tar.gz"
+        for f in "$archive" checksums.txt checksums.txt.sigstore.json; do curl -fsSLO "$base/$f"; done
+        cat > cosign.pub <<'KEY'
+        -----BEGIN PUBLIC KEY-----
+        MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE69u2ja9r2k/Vy8lSibowBdCnCD3P
+        OVzmcbjHVIvMgoOfkEzEwOY/b8kyjTVJcwrJ89+qC5bjW4XzLqz1S/AryQ==
+        -----END PUBLIC KEY-----
+        KEY
+        cosign verify-blob --key cosign.pub --bundle checksums.txt.sigstore.json checksums.txt
+        grep " $archive\$" checksums.txt | sha256sum -c -
+        sudo tar xz -C /usr/local/bin -f "$archive" shoalcheck
+        shoalcheck version
 
-    - name: Run shoalcheck
-      id: run
+    # THE BASELINE AND THE ACCEPTANCES COME FROM WHAT IS BEING MERGED INTO, by event: a pull request's base branch, a
+    # merge queue's base commit. A push, a schedule or a manual run is the branch itself, so its checkout is the
+    # branch's. Any other event's checkout is not trusted for either file, and the step refuses rather than guess.
+    # The base is fetched into a ref of its own, never read from whatever was fetched last, and a failed fetch stops the run: a
+    # gate that silently judged without its baseline would compare against nothing and could pass.
+    - name: Baseline and acceptances from the base
+      if: steps.secrets.outputs.present == 'true'
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
       env:
-        ARGS: ${{ inputs.args }}
-        KUBECONFIG_CONTENT: ${{ inputs.kubeconfig }}
-        SHOALCHECK_CAPTURE_KEY: ${{ inputs.capture-key }}
-        SHOALCHECK_LICENCE: ${{ inputs.licence }}
-        SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck-home
-        SUMMARY: ${{ inputs.summary }}
+        EVENT: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        BASELINE: ${{ inputs.baseline }}
+        ACCEPT: ${{ inputs.accept }}
       run: |
-        if [ -n "$KUBECONFIG_CONTENT" ]; then
-          umask 077
-          printf '%s\n' "$KUBECONFIG_CONTENT" > "$RUNNER_TEMP/shoalcheck-kubeconfig"
-          export KUBECONFIG="$RUNNER_TEMP/shoalcheck-kubeconfig"
+        out="$RUNNER_TEMP/shoalcheck-base"; mkdir -p "$out"
+        base=""
+        case "$EVENT" in
+          pull_request|pull_request_target)
+            git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/shoalcheck/base" || { echo "::error::could not fetch the base branch $BASE_REF"; exit 1; }
+            base="refs/shoalcheck/base" ;;
+          merge_group)
+            git fetch --no-tags --depth=1 origin "+${MERGE_BASE_SHA}:refs/shoalcheck/base" || { echo "::error::could not fetch the merge queue's base $MERGE_BASE_SHA"; exit 1; }
+            base="refs/shoalcheck/base" ;;
+          push|schedule|workflow_dispatch) ;;
+          *) echo "::error::on a $EVENT event the checkout is not trusted for the baseline and the acceptances; run the gate on pull_request, merge_group, push, schedule or workflow_dispatch"; exit 1 ;;
+        esac
+        take() { # take <path in the repository> <file to write>
+          [ -n "$1" ] || return 0
+          if [ -n "$base" ]; then
+            git show "$base:$1" > "$2" 2>/dev/null || rm -f "$2"
+          elif [ -f "$1" ]; then
+            cp "$1" "$2"
+          fi
+        }
+        take "$BASELINE" "$out/baseline.json"
+        take "$ACCEPT" "$out/accept.yaml"
+        [ -f "$out/baseline.json" ] || echo "no baseline at $BASELINE on the base: the cluster is not compared with one"
+        [ -f "$out/accept.yaml" ] || echo "no acceptance file at $ACCEPT on the base: nothing is accepted"
+
+    - name: Gate
+      id: gate
+      if: steps.secrets.outputs.present == 'true'
+      shell: bash
+      env:
+        SHOALCHECK_LICENCE: ${{ inputs.licence }}
+        KUBECONFIG_CONTENT: ${{ inputs.kubeconfig }}
+        SHOALCHECK_HOME: ${{ runner.temp }}/shoalcheck-home
+        CONTEXT: ${{ inputs.context }}
+        WITH: ${{ inputs.with }}
+        NAMESPACE: ${{ inputs.namespace }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        ANNOTATE: ${{ inputs.annotations }}
+        PUBLISH: ${{ steps.visibility.outputs.publish }}
+      run: |
+        out="$RUNNER_TEMP/shoalcheck-base"
+        export KUBECONFIG="$RUNNER_TEMP/shoalcheck-kubeconfig"
+        printf '%s\n' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"; chmod 600 "$KUBECONFIG"
+        args=(gate --fail-on "$FAIL_ON" --md "$RUNNER_TEMP/shoalcheck-comment.md" --json "$RUNNER_TEMP/shoalcheck-reading.json")
+        [ -n "$CONTEXT" ] && args+=(--context "$CONTEXT")
+        [ -f "$out/baseline.json" ] && args+=(--baseline "$out/baseline.json")
+        [ -f "$out/accept.yaml" ] && args+=(--accept "$out/accept.yaml")
+        if [ -n "$WITH" ]; then
+          args+=(--with "$WITH")
+          [ -n "$NAMESPACE" ] && args+=(--namespace "$NAMESPACE")
         fi
-        [ -n "$SHOALCHECK_CAPTURE_KEY" ] || unset SHOALCHECK_CAPTURE_KEY
-        [ -n "$SHOALCHECK_LICENCE" ] || unset SHOALCHECK_LICENCE
-        set -f; read -r -a argv <<< "$ARGS"; set +f
+        [ "$ANNOTATE" = "true" ] && [ "$PUBLISH" = "true" ] && args+=(--annotations "$RUNNER_TEMP/shoalcheck-annotations.txt" --source-root "$GITHUB_WORKSPACE")
+        # Withheld, both streams go to a file: an error names the API server's address as readily as a finding names
+        # a workload.
+        held="$RUNNER_TEMP/shoalcheck-withheld.txt"
         set +e
-        shoalcheck "${argv[@]}" 2>&1 | tee "$RUNNER_TEMP/shoalcheck-output.txt"
-        code=${PIPESTATUS[0]}
-        set -e
-        if [ "$SUMMARY" = true ]; then
-          { echo '### shoalcheck'; echo '~~~~text'; cat "$RUNNER_TEMP/shoalcheck-output.txt"; echo '~~~~'; } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$PUBLISH" = "true" ]; then
+          shoalcheck "${args[@]}" -o text
+        else
+          shoalcheck "${args[@]}" -o text > "$held" 2>&1
         fi
-        rm -f "$RUNNER_TEMP/shoalcheck-output.txt"
-        rm -f "$RUNNER_TEMP/shoalcheck-kubeconfig"
+        code=$?
+        set -e
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-        exit "$code"
+        if [ "$PUBLISH" = "true" ]; then
+          [ -s "$RUNNER_TEMP/shoalcheck-annotations.txt" ] && cat "$RUNNER_TEMP/shoalcheck-annotations.txt"
+          [ -s "$RUNNER_TEMP/shoalcheck-comment.md" ] && cat "$RUNNER_TEMP/shoalcheck-comment.md" >> "$GITHUB_STEP_SUMMARY"
+        else
+          case "$code" in
+            0) what="satisfied" ;; 2) what="fired" ;; 1) what="could not be judged" ;; 4) what="no licence for the gate" ;;
+            *) what="ended on an unexpected code" ;;
+          esac
+          line="shoalcheck gate: exit $code, $what. This repository is public, so the details are withheld; public-details: 'true' publishes them."
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$held" "$RUNNER_TEMP/shoalcheck-comment.md"
+        fi
+        rm -f "$KUBECONFIG"
+
+    # ONE COMMENT PER PULL REQUEST, found by the marker on its first line and updated in place, so twenty pushes leave
+    # one comment saying what the latest one decided rather than twenty.
+    - name: Comment on the pull request
+      if: always() && steps.secrets.outputs.present == 'true' && steps.visibility.outputs.publish == 'true' && inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+      run: |
+        body="$RUNNER_TEMP/shoalcheck-comment.md"
+        [ -s "$body" ] || exit 0
+        id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+          --jq '.[] | select(.user.type == "Bot" and (.body | startswith("<!-- shoalcheck-gate -->"))) | .id' | tail -n 1)
+        if [ -n "$id" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" >/dev/null
+        else
+          gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$body" >/dev/null
+        fi
+
+    - name: The gate's exit code
+      if: steps.secrets.outputs.present == 'true'
+      shell: bash
+      env:
+        CODE: ${{ steps.gate.outputs.exit-code }}
+      run: exit "${CODE:-1}"

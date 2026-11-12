@@ -1,28 +1,76 @@
 name: selftest
-# Runs this action from the repository itself on every runner image it supports: download, signature and
-# checksum verification, PATH, and the exit code passed through. No cluster is needed for `version`.
+# Runs v2 from this repository against a real cluster: a kind cluster made in the job, and a change with one deliberate
+# mistake laid over it. Checks that the release installs only after its signature and checksum verify, that this public
+# repository publishes nothing of the reading by default, that public-details publishes it, and that the gate's exit
+# code is what the job ends on.
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  selftest:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest]
-    runs-on: ${{ matrix.os }}
+  gate:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
-      - id: sc
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: A kind cluster
+        id: kind
+        run: |
+          command -v kind || { go install sigs.k8s.io/kind@v0.29.0; export PATH="$PATH:$(go env GOPATH)/bin"; }
+          kind create cluster --name selftest --wait 120s
+          { echo 'kubeconfig<<KUBECONFIG_END'; kind get kubeconfig --name selftest; echo KUBECONFIG_END; } >> "$GITHUB_OUTPUT"
+      - name: A change with one mistake
+        run: |
+          mkdir -p "$RUNNER_TEMP/change"
+          cat > "$RUNNER_TEMP/change/deploy.yaml" <<'YAML'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: selftest, namespace: default}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: selftest}}
+            template:
+              metadata: {labels: {app: selftest}}
+              spec:
+                containers:
+                  - name: app
+                    image: nginx:latest
+                    securityContext: {privileged: true}
+          YAML
+      - id: quiet
         uses: ./
         with:
-          args: version
-      - shell: bash
+          version: 0.2.0
+          licence: ${{ secrets.SHOALCHECK_LICENCE }}
+          kubeconfig: ${{ steps.kind.outputs.kubeconfig }}
+          with: ${{ runner.temp }}/change
+          fail-on: none
+      - id: fired
+        continue-on-error: true
+        uses: ./
+        with:
+          version: 0.2.0
+          licence: ${{ secrets.SHOALCHECK_LICENCE }}
+          kubeconfig: ${{ steps.kind.outputs.kubeconfig }}
+          with: ${{ runner.temp }}/change
+          fail-on: new
+      - id: details
+        uses: ./
+        with:
+          version: 0.2.0
+          licence: ${{ secrets.SHOALCHECK_LICENCE }}
+          kubeconfig: ${{ steps.kind.outputs.kubeconfig }}
+          with: ${{ runner.temp }}/change
+          fail-on: none
+          public-details: 'true'
+      - name: What the three runs decided
+        env:
+          Q: ${{ steps.quiet.outputs.gated }} ${{ steps.quiet.outputs.published }} ${{ steps.quiet.outputs.exit-code }}
+          F: ${{ steps.fired.outputs.gated }} ${{ steps.fired.outputs.published }} ${{ steps.fired.outputs.exit-code }} ${{ steps.fired.outcome }}
+          D: ${{ steps.details.outputs.gated }} ${{ steps.details.outputs.published }} ${{ steps.details.outputs.exit-code }}
         run: |
-          echo "exit-code=${{ steps.sc.outputs.exit-code }} version=${{ steps.sc.outputs.version }}"
-          test "${{ steps.sc.outputs.exit-code }}" = 0
-          shoalcheck version | head -1 | grep -q "shoalcheck ${{ steps.sc.outputs.version }}"
+          echo "quiet:   $Q"; echo "fired:   $F"; echo "details: $D"
+          test "$Q" = "true false 0"
+          test "$F" = "true false 2 failure"
+          test "$D" = "true true 0"
